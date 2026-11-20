@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import time
 
 from seahorse.game.action import Action
@@ -36,13 +37,13 @@ V_BASE = 200
 STEP = 120
 
 # ---- Wall pricing -------------------------------------------------------
-# Worth of the walls still in hand, indexed by count. A wall that adds one step
-# to their path trades evenly with one pawn step of ours, so what it really
-# costs is the wall itself: the marginal value below. Late walls are worth far
-# more, because only then does the opponent's path have a short route next to
-# a much longer one, and a single wall can switch between them.
-# Marginals, tenth wall to last: 60 80 100 130 170 220 270 330 380 420.
-WALL_VALUE = (0, 420, 800, 1130, 1400, 1620, 1790, 1920, 2020, 2100, 2160)
+# Worth of the walls still in hand, indexed by count. Every wall is priced
+# above a single pawn step (120) so early walls are not dumped lightly, while
+# late walls stay below 2.1x a step to avoid hoarding in losing endgames.
+# Marginals, tenth wall to first: 135 145 155 165 175 185 200 215 230 245.
+WALL_VALUE = (0, 245, 475, 690, 890, 1075, 1250, 1415, 1570, 1715, 1850)
+# Side-to-move tempo bonus.
+TEMPO = 25
 # A root pawn move that lengthens our own path must beat the others by this much.
 REGRESS_PENALTY = 45
 
@@ -67,21 +68,21 @@ REPEAT_BUDGET = 0.2
 # Share of the clock we may have used by ply TIME_PLAN_PLY.
 TIME_PLAN_SHARE = 0.35
 TIME_PLAN_PLY = 40
-CAP_SHARP = 60 / 900
-CAP_SHARP_FEW_WALLS = 24 / 900
+CAP_SHARP = 25 / 900
+CAP_SHARP_FEW_WALLS = 16 / 900
 CAP_ORDINARY = 12 / 900
 CAP_OPENING = 6 / 900
-CAP_OVER_PLAN = 4 / 900
+CAP_OVER_PLAN = 9 / 900
 # Kept back until the pawns have passed each other.
 CONTACT_RESERVE = 150 / 900
 # Per step beyond the first that the best single wall would add to a path.
 # STRIKE when the wall's owner moves next, DODGE when the victim does.
-THREAT_STRIKE = 60
+THREAT_STRIKE = 45
 THREAT_DODGE = 25
-THREAT_CAP = 7
+THREAT_CAP = 5
 TT_LIMIT = 1_200_000
-# One JSON line per move in logs/ next to this file.
-MOVE_LOG = True
+# One JSON line per move in logs/ next to this file (opt-in via env var).
+MOVE_LOG = os.environ.get("QUORIDOR_MOVE_LOG", "0") == "1"
 
 FULL_V = (1 << 72) - 1
 FULL_H = sum(1 << (r * 9 + c) for r in range(9) for c in range(8))
@@ -99,8 +100,6 @@ except AttributeError:  # Python < 3.10
 
 
 def _zobrist_tables():
-    import random
-
     rng = random.Random(0xC0FFEE)
     def rnd():
         return rng.getrandbits(64)
@@ -110,15 +109,18 @@ def _zobrist_tables():
     vertical = [rnd() for _ in range(64)]
     walls_left = [[rnd() for _ in range(11)] for _ in range(2)]
     side = rnd()
-    return pawns, horizontal, vertical, walls_left, side
+    goal = rnd()
+    return pawns, horizontal, vertical, walls_left, side, goal
 
 
-Z_PAWN, Z_H, Z_V, Z_LEFT, Z_SIDE = _zobrist_tables()
+Z_PAWN, Z_H, Z_V, Z_LEFT, Z_SIDE, Z_GOAL = _zobrist_tables()
 
 
 def _edge_walls():
     """Walls that close each directed step, matching ``_candidate_blocking_walls``."""
     table = {}
+    v_walls: list[tuple[int, ...]] = [() for _ in range(72)]
+    h_walls: list[tuple[int, ...]] = [() for _ in range(81)]
     for r in range(9):
         for c in range(9):
             a = r * 9 + c
@@ -128,7 +130,9 @@ def _edge_walls():
                     walls.append(H_BASE + r * 8 + (c - 1))
                 if c < 8:
                     walls.append(H_BASE + r * 8 + c)
-                table[(a, a + 9)] = tuple(walls)
+                tup = tuple(walls)
+                table[(a, a + 9)] = tup
+                v_walls[a] = tup
             if r > 0:
                 walls = []
                 if c > 0:
@@ -142,7 +146,9 @@ def _edge_walls():
                     walls.append(V_BASE + (r - 1) * 8 + c)
                 if r < 8:
                     walls.append(V_BASE + r * 8 + c)
-                table[(a, a + 1)] = tuple(walls)
+                tup = tuple(walls)
+                table[(a, a + 1)] = tup
+                h_walls[a] = tup
             if c > 0:
                 walls = []
                 if r > 0:
@@ -150,10 +156,82 @@ def _edge_walls():
                 if r < 8:
                     walls.append(V_BASE + r * 8 + (c - 1))
                 table[(a, a - 1)] = tuple(walls)
-    return table
+    return table, tuple(v_walls), tuple(h_walls)
 
 
-EDGE_WALLS = _edge_walls()
+EDGE_WALLS, V_EDGE_WALLS, H_EDGE_WALLS = _edge_walls()
+
+
+def _wall_geometry_tables():
+    """Precomputed wall anchor positions, edge flags, touch masks, and conflict sets."""
+    pos: dict[int, tuple[int, int]] = {}
+    on_edge: dict[int, bool] = {}
+    touch_h: dict[int, int] = {}
+    touch_v: dict[int, int] = {}
+    conflicts: dict[int, tuple[int, ...]] = {}
+
+    for idx in range(64):
+        r, c = divmod(idx, 8)
+        # Horizontal wall: grid segment y = r + 1, x in [c, c + 2].
+        hw = H_BASE + idx
+        pos[hw] = (r, c)
+        on_edge[hw] = (c == 0 or c == 7)
+        th = 0
+        if c >= 2:
+            th |= 1 << (idx - 2)
+        if c <= 5:
+            th |= 1 << (idx + 2)
+        tv = 0
+        for vr in range(max(0, r - 1), min(7, r + 1) + 1):
+            for vc in range(max(0, c - 1), min(7, c + 1) + 1):
+                if vr == r and vc == c:
+                    continue
+                tv |= 1 << (vr * 8 + vc)
+        touch_h[hw] = th
+        touch_v[hw] = tv
+        conf = [V_BASE + idx]
+        if c > 0:
+            conf.append(H_BASE + idx - 1)
+        if c < 7:
+            conf.append(H_BASE + idx + 1)
+        conflicts[hw] = tuple(conf)
+
+        # Vertical wall: grid segment x = c + 1, y in [r, r + 2].
+        vw = V_BASE + idx
+        pos[vw] = (r, c)
+        on_edge[vw] = (r == 0 or r == 7)
+        tv2 = 0
+        if r >= 2:
+            tv2 |= 1 << (idx - 16)
+        if r <= 5:
+            tv2 |= 1 << (idx + 16)
+        th2 = 0
+        for wr in range(max(0, r - 1), min(7, r + 1) + 1):
+            for wc in range(max(0, c - 1), min(7, c + 1) + 1):
+                if wr == r and wc == c:
+                    continue
+                th2 |= 1 << (wr * 8 + wc)
+        touch_h[vw] = th2
+        touch_v[vw] = tv2
+        conf2 = [H_BASE + idx]
+        if r > 0:
+            conf2.append(V_BASE + idx - 8)
+        if r < 7:
+            conf2.append(V_BASE + idx + 8)
+        conflicts[vw] = tuple(conf2)
+
+    return pos, on_edge, touch_h, touch_v, conflicts
+
+
+WALL_POS, WALL_ON_EDGE, WALL_TOUCH_H, WALL_TOUCH_V, WALL_CONFLICTS = _wall_geometry_tables()
+
+
+def _wall_worth(walls: int, enemy_d: int) -> int:
+    """Wall reserve value with a symmetric endgame usability taper when enemy_d <= 2."""
+    if enemy_d <= 2 and walls > 2:
+        usable = WALL_VALUE[2]
+        return usable + ((WALL_VALUE[walls] - usable) >> 2)
+    return WALL_VALUE[walls]
 
 
 class SearchTimeout(Exception):
@@ -165,13 +243,12 @@ class Engine:
 
     __slots__ = (
         "vmask", "hmask", "h_walls", "v_walls", "pawns", "goals",
-        "walls_left", "side", "ply", "zhash", "cache", "paths", "tt", "history",
+        "walls_left", "side", "ply", "zhash", "paths", "tt", "history",
         "killers", "deadline", "nodes", "ext", "dcache", "root_pawn",
         "completed_depth", "completed_score", "line", "played", "contempt", "banned",
     )
 
-    def __init__(self, cache: dict, paths: dict, tt: dict, history: list[int]) -> None:
-        self.cache = cache
+    def __init__(self, paths: dict, tt: dict, history: list[int]) -> None:
         self.paths = paths
         self.tt = tt
         self.history = history
@@ -234,6 +311,8 @@ class Engine:
     def _compute_hash(self) -> int:
         h = Z_PAWN[0][self.pawns[0]] ^ Z_PAWN[1][self.pawns[1]]
         h ^= Z_LEFT[0][self.walls_left[0]] ^ Z_LEFT[1][self.walls_left[1]]
+        if self.goals[0] == 8:
+            h ^= Z_GOAL
         if self.side:
             h ^= Z_SIDE
         bits = self.h_walls
@@ -338,18 +417,16 @@ class Engine:
                 break
             reached = grown
             d += 1
-        if len(dcache) > 600_000:
-            dcache.clear()
-        dcache[key] = d
+        if len(dcache) < 1_000_000:
+            dcache[key] = d
         return d
 
-    def _race(self, start: int, goal_row: int):
-        """Pawn-ignoring (distance, narrowest layer of the shortest-path DAG).
+    def _race_masks(self, start: int, goal_row: int, v: int, h: int):
+        """Pawn-ignoring (distance, narrowest layer of the shortest-path DAG) on given masks.
 
         ``(None, 0)`` when the row is unreachable. A narrowest layer of one cell
         means every shortest path squeezes through that cell.
         """
-        v, h = self.vmask, self.hmask
         key = (start, goal_row + 16, v, h)
         dcache = self.dcache
         hit = dcache.get(key)
@@ -383,13 +460,16 @@ class Engine:
                     break
                 layers.append(front)
                 seen |= front
-        if len(dcache) > 600_000:
-            dcache.clear()
-        dcache[key] = result
+        if len(dcache) < 1_000_000:
+            dcache[key] = result
         return result
 
+    def _race(self, start: int, goal_row: int):
+        """Pawn-ignoring (distance, narrowest layer of the shortest-path DAG)."""
+        return self._race_masks(start, goal_row, self.vmask, self.hmask)
+
     def _path(self, start: int, goal_row: int):
-        """One shortest path: length, narrowest layer, first step, walls that cut it.
+        """Full shortest-path DAG: length, narrowest layer, first step, walls cutting any DAG edge.
 
         Blockers run from the goal end back to the pawn.
         """
@@ -402,9 +482,8 @@ class Engine:
         if hit is not None:
             return hit
         result = self._trace(start, goal_row, v, h)
-        if len(paths) > 300_000:
-            paths.clear()
-        paths[key] = result
+        if len(paths) < 500_000:
+            paths[key] = result
         return result
 
     def _trace(self, start: int, goal_row: int, v: int, h: int):
@@ -421,51 +500,154 @@ class Engine:
                 break
             layers.append(front)
             seen |= front
-        back = front & goal
-        narrow = _popcount(back)
-        cur = back & -back
-        cells = [cur.bit_length() - 1]
+        upper = front & goal
+        narrow = _popcount(upper)
+        blockers: list[int] = []
+        seen_walls: set[int] = set()
+        first_step = -1
+        for k in range(len(layers) - 1, -1, -1):
+            if k > 0:
+                lower = layers[k] & (((upper >> 9) & v) | ((upper & v) << 9)
+                                     | ((upper >> 1) & h) | ((upper & h) << 1))
+                width = _popcount(lower)
+                if width < narrow:
+                    narrow = width
+            else:
+                lower = layers[0]
+                bits = upper
+                best_step = -1
+                best_key = -1000
+                while bits:
+                    lsb = bits & -bits
+                    bits ^= lsb
+                    cell = lsb.bit_length() - 1
+                    key = -abs(ROW[cell] - goal_row) * 10 - abs((cell % 9) - 4)
+                    if key > best_key:
+                        best_key = key
+                        best_step = cell
+                first_step = best_step
+
+            v_edges = v & ((lower & (upper >> 9)) | (upper & (lower >> 9)))
+            while v_edges:
+                lsb = v_edges & -v_edges
+                v_edges ^= lsb
+                for wall in V_EDGE_WALLS[lsb.bit_length() - 1]:
+                    if wall not in seen_walls:
+                        seen_walls.add(wall)
+                        blockers.append(wall)
+
+            h_edges = h & ((lower & (upper >> 1)) | (upper & (lower >> 1)))
+            while h_edges:
+                lsb = h_edges & -h_edges
+                h_edges ^= lsb
+                for wall in H_EDGE_WALLS[lsb.bit_length() - 1]:
+                    if wall not in seen_walls:
+                        seen_walls.add(wall)
+                        blockers.append(wall)
+
+            upper = lower
+        return (len(layers), narrow, first_step, tuple(blockers))
+
+    def _single_blockers(self, start: int, goal_row: int, v: int, h: int) -> frozenset[int]:
+        """Walls cutting one shortest path from start to goal_row (superset of all lengthening walls)."""
+        if ROW[start] == goal_row:
+            return frozenset()
+        key = (start, goal_row + 48, v, h)
+        dcache = self.dcache
+        hit = dcache.get(key)
+        if hit is not None:
+            return hit
+        goal = GOAL_MASK[goal_row]
+        front = 1 << start
+        layers = [front]
+        seen = front
+        while True:
+            front = (((front >> 9) & v) | ((front & v) << 9)
+                     | ((front >> 1) & h) | ((front & h) << 1)) & ~seen
+            if not front:
+                res = frozenset()
+                if len(dcache) < 1_000_000:
+                    dcache[key] = res
+                return res
+            if front & goal:
+                break
+            layers.append(front)
+            seen |= front
+        cur = (front & goal) & -(front & goal)
+        cell = cur.bit_length() - 1
+        walls: set[int] = set()
         for k in range(len(layers) - 1, 0, -1):
-            back = layers[k] & (((back >> 9) & v) | ((back & v) << 9)
-                                | ((back >> 1) & h) | ((back & h) << 1))
-            width = _popcount(back)
-            if width < narrow:
-                narrow = width
             step = layers[k] & (((cur >> 9) & v) | ((cur & v) << 9)
                                 | ((cur >> 1) & h) | ((cur & h) << 1))
-            cur = step & -step
-            cells.append(cur.bit_length() - 1)
-        cells.append(start)
-        blockers = []
-        seen_walls = set()
-        for i in range(len(cells) - 1):
-            for wall in EDGE_WALLS[(cells[i + 1], cells[i])]:
-                if wall not in seen_walls:
-                    seen_walls.add(wall)
-                    blockers.append(wall)
-        return (len(layers), narrow, cells[-2], tuple(blockers))
+            nxt = step & -step
+            ncell = nxt.bit_length() - 1
+            walls.update(EDGE_WALLS[(ncell, cell)])
+            cur = nxt
+            cell = ncell
+        walls.update(EDGE_WALLS[(start, cell)])
+        res = frozenset(walls)
+        if len(dcache) < 1_000_000:
+            dcache[key] = res
+        return res
 
-    def _threat(self, start: int, goal_row: int, d: int) -> int:
-        """Most steps one more wall can add to this pawn's path."""
-        v, h = self.vmask, self.hmask
+    def _raw_threats(self, start: int, goal_row: int, d: int, v: int, h: int) -> tuple[tuple[int, int], ...]:
+        """Cached list of (delta_d, wall) for geometrically legal walls that lengthen this path."""
         key = (start, goal_row + 32, v, h)
         dcache = self.dcache
         hit = dcache.get(key)
         if hit is not None:
             return hit
-        worst = 0
+        raw: list[tuple[int, int]] = []
         if d:
-            # A wall that lengthens the path cuts every shortest path, this one included.
-            for wall in self._path(start, goal_row)[3]:
+            dist = self._dist
+            for wall in self._single_blockers(start, goal_row, v, h):
                 if not self.geometry_ok(wall):
                     continue
                 nv, nh = self._masks_after(wall)
-                nd = self._dist(start, goal_row, nv, nh)
-                if nd is not None and nd - d > worst:
-                    worst = nd - d
-        if len(dcache) > 600_000:
-            dcache.clear()
-        dcache[key] = worst
+                nd = dist(start, goal_row, nv, nh)
+                if nd is not None and nd > d:
+                    raw.append((nd - d, wall))
+            if len(raw) > 1:
+                raw.sort(reverse=True)
+        res = tuple(raw)
+        if len(dcache) < 1_000_000:
+            dcache[key] = res
+        return res
+
+    def _threat(
+        self,
+        defender: int,
+        defender_goal: int,
+        defender_d: int,
+        attacker: int,
+        attacker_goal: int,
+        attacker_d: int,
+    ) -> int:
+        """Maximum legal net detour one wall can inflict on defender vs attacker."""
+        if not defender_d:
+            return 0
+        v, h = self.vmask, self.hmask
+        raw = self._raw_threats(defender, defender_goal, defender_d, v, h)
+        if not raw:
+            return 0
+        worst = 0
+        dist = self._dist
+        attacker_single: frozenset[int] | None = None
+        for delta_def, wall in raw:
+            if delta_def <= worst:
+                break
+            if attacker_single is None:
+                attacker_single = self._single_blockers(attacker, attacker_goal, v, h)
+            if wall in attacker_single:
+                nv, nh = self._masks_after(wall)
+                na = dist(attacker, attacker_goal, nv, nh)
+                if na is None:
+                    continue
+                net = delta_def - (na - attacker_d)
+            else:
+                net = delta_def
+            if net > worst:
+                worst = net
         return worst
 
     def _cell_dist(self, start: int, target: int):
@@ -492,9 +674,8 @@ class Engine:
                 found = d
                 break
             seen |= front
-        if len(dcache) > 600_000:
-            dcache.clear()
-        dcache[key] = found
+        if len(dcache) < 1_000_000:
+            dcache[key] = found
         return None if found < 0 else found
 
     def _on_shortest_path(self, cell: int, start: int, goal_row: int, path_len: int) -> bool:
@@ -509,32 +690,18 @@ class Engine:
         return via + rest == path_len
 
     def _pawns_interact(self, d0: int, d1: int) -> bool:
-        """True when a jump or a blocked landing can still change the static race.
+        """True unless the pawns mathematically cannot meet before the leader finishes.
 
-        Distance ignores the other pawn, so an equal race is a proven win only
-        after the pawns have passed, or the leader finishes before a jump can
-        land, or neither pawn lies on the other's shortest path and the row
-        gap is too wide for a one-step approach.
+        Uses wall-aware graph distance ``sep = _cell_dist(p0, p1)``. Over at most
+        ``leader`` turns (<= 2 * leader - 1 plies before the leader's final step),
+        the graph separation between pawns can shrink by at most 2 * leader - 1,
+        so if ``sep > 2 * leader`` they can never become adjacent.
         """
-        p0 = self.pawns[0]
-        p1 = self.pawns[1]
-        r0 = ROW[p0]
-        r1 = ROW[p1]
-        gap = abs(r0 - r1)
-        if p0 != p1 and max(gap, abs((p0 % 9) - (p1 % 9))) <= 2:
-            return True
-        faces0 = (r1 - r0) * (self.goals[0] - r0) > 0
-        faces1 = (r0 - r1) * (self.goals[1] - r1) > 0
-        if not faces0 and not faces1:
-            return False
         leader = d0 if d0 <= d1 else d1
-        if leader < max(0, gap - 2):
+        sep = self._cell_dist(self.pawns[0], self.pawns[1])
+        if sep is None or sep > 2 * leader:
             return False
-        if self._on_shortest_path(p1, p0, self.goals[0], d0):
-            return True
-        if self._on_shortest_path(p0, p1, self.goals[1], d1):
-            return True
-        return gap <= 3
+        return True
 
     def _pawns_facing(self) -> bool:
         """True until the pawns have passed: one still stands between the other and its goal."""
@@ -618,7 +785,7 @@ class Engine:
     # Evaluation and moves
     # ------------------------------------------------------------------
 
-    def evaluate(self) -> int:
+    def evaluate(self, alpha: int = -INF, beta: int = INF) -> int:
         if self._winning_destination() is not None:
             return MATE - (self.ply + 1)
 
@@ -643,30 +810,66 @@ class Engine:
         # A static race is finished only while a jump cannot rewrite it.
         # Otherwise keep the normal gradient and let the search play the meeting.
         if opp_left == 0 and adv >= 0 and not self._pawns_interact(d0, d1):
-            return FORCED_RACE + 10_000 - my_d * 20
+            return FORCED_RACE + 10_000 - my_d * 100 + opp_d
         if my_left == 0 and adv < 0 and not self._pawns_interact(d0, d1):
-            return -(FORCED_RACE + 10_000) + opp_d * 20 - my_d
+            return -(FORCED_RACE + 10_000) + opp_d * 100 - my_d
 
-        score = adv * STEP - my_d * 3 + WALL_VALUE[my_left] - WALL_VALUE[opp_left]
+        score = adv * STEP + TEMPO + _wall_worth(my_left, opp_d) - _wall_worth(opp_left, my_d)
+        # Symmetric centrality difference.
+        score += (abs((self.pawns[opp] % 9) - 4) - abs((self.pawns[side] % 9) - 4)) * 4
+
+        # Immediate jump-ready tempo bonus when pawns are orthogonally adjacent with an open edge.
+        my_p = self.pawns[side]
+        opp_p = self.pawns[opp]
+        diff = my_p - opp_p
+        if (
+            (diff == 9 or diff == -9 or (diff == 1 and (my_p % 9) != 0) or (diff == -1 and (opp_p % 9) != 0))
+            and self._open(my_p, opp_p)
+        ):
+            my_goal = self.goals[side]
+            v, h = self.vmask, self.hmask
+            for dest in self._pawn_destinations():
+                nd = self._dist(dest, my_goal, v, h)
+                if nd is not None and nd <= my_d - 2:
+                    score += STEP // 2
+                    break
+
+        # Sound lazy evaluation bounds for the expensive _threat() terms.
+        check_dodge = bool(opp_left and my_narrow <= 2)
+        check_strike = bool(my_left and opp_narrow <= 2)
+        max_neg = (THREAT_CAP - 1) * THREAT_DODGE if check_dodge else 0
+        max_pos = (THREAT_CAP - 1) * THREAT_STRIKE if check_strike else 0
+        if score - max_neg >= beta:
+            return score - max_neg
+        if score + max_pos <= alpha:
+            return score + max_pos
+
         # A pawn in a corridor one wall can seal is far worse off than its
         # distance says: the holder of that wall plays it at the last moment.
-        # A wall closes two edges; with three or more cells in every layer of the
-        # shortest-path graph, each layer change keeps an open edge.
         # The side to move can still step out of a trap or drop its own wall first,
         # so its exposure counts less than the one it can spring right now.
-        if opp_left and my_narrow <= 2:
-            threat = self._threat(self.pawns[side], self.goals[side], my_d)
+        if check_dodge:
+            threat = self._threat(
+                my_p, self.goals[side], my_d,
+                opp_p, self.goals[opp], opp_d,
+            )
             if threat > 1:
                 score -= (min(threat, THREAT_CAP) - 1) * THREAT_DODGE
             elif my_narrow <= 1:
-                score -= 20
-        if my_left and opp_narrow <= 2:
-            threat = self._threat(self.pawns[opp], self.goals[opp], opp_d)
+                score -= 16
+            if score >= beta:
+                return score
+            if score + max_pos <= alpha:
+                return score + max_pos
+        if check_strike:
+            threat = self._threat(
+                opp_p, self.goals[opp], opp_d,
+                my_p, self.goals[side], my_d,
+            )
             if threat > 1:
                 score += (min(threat, THREAT_CAP) - 1) * THREAT_STRIKE
             elif opp_narrow <= 1:
                 score += 16
-        score -= abs((self.pawns[side] % 9) - 4)
         return score
 
     def _collect_walls(self, depth: int) -> list[tuple[int, int]]:
@@ -674,11 +877,10 @@ class Engine:
         if self.walls_left[side] <= 0:
             return []
         opp = side ^ 1
-        info = self.analyze()
-        my_d = info[side][0]
-        opp_d = info[opp][0]
-        opp_narrow = info[opp][1]
-        blockers = info[opp][3]
+        pawns = self.pawns
+        goals = self.goals
+        my_d, my_narrow = self._race(pawns[side], goals[side])
+        opp_d, opp_narrow, _opp_step, blockers = self._path(pawns[opp], goals[opp])
         if my_d is None or opp_d is None or not blockers:
             return []
         # Ahead, and they have nothing left to drop in front of us: run.
@@ -687,9 +889,8 @@ class Engine:
 
         root = self.ply == 0
         critical = opp_d <= 2
-        # Deep in the tree, the walls that matter are the ones in front of the
-        # pawn and the ones sealing the goal. The root sees every candidate.
-        if not root and not critical and depth < 6 and len(blockers) > 8:
+        # Only trim mid-path blockers at shallow depths (depth <= 2).
+        if not root and not critical and depth <= 2 and len(blockers) > 8:
             keep = list(blockers[:4]) + list(blockers[-6:])
             trimmed = []
             seen_walls = set()
@@ -700,11 +901,19 @@ class Engine:
             blockers = trimmed
         if time.perf_counter() >= self.deadline:
             raise SearchTimeout
-        my_blocks = set(info[side][3])
-        pawns = self.pawns
-        goals = self.goals
+
+        vmask, hmask = self.vmask, self.hmask
+        my_blocks = self._single_blockers(pawns[side], goals[side], vmask, hmask)
+        opp_r, opp_c = divmod(pawns[opp], 9)
         dist = self._dist
-        scored: list[tuple[int, int]] = []
+        h_walls = self.h_walls
+        v_walls = self.v_walls
+        allow_setup = root or depth >= 2
+        allow_zero_gain = (root or depth >= 2) and (opp_d <= 5 or opp_narrow <= 2)
+
+        tactical: list[tuple[int, int]] = []
+        setup: list[tuple[int, int]] = []
+
         for wall in blockers:
             if not self.geometry_ok(wall):
                 continue
@@ -721,46 +930,154 @@ class Engine:
             delta_opp = new_opp - opp_d
             delta_my = new_my - my_d
             gain = delta_opp - delta_my
-            if critical and delta_opp >= 1:
-                priority = 1_800_000 + delta_opp * 10_000 - delta_my * 1_000
-            elif delta_opp >= 1 and gain >= 1:
-                priority = 1_500_000 + gain * 10_000 + delta_opp * 100 - delta_my * 100
-            elif (
-                (depth >= 6 or root)
-                and delta_my == 0
-                and delta_opp == 0
-                and opp_narrow >= 2
-            ):
-                # The wall sits on their current route but a twin route remains.
-                # Keep a couple of these so a follow-up wall is visible a few plies later.
-                priority = 700_000
-            else:
-                continue
-            priority += min(self.history[wall], 4_000) >> 4
-            scored.append((priority, wall))
+            hist_bonus = min(self.history[wall], 4_000) >> 4
 
-        if not scored:
+            wr, wc = WALL_POS[wall]
+            dr = 0 if wr <= opp_r <= wr + 1 else (wr - opp_r if opp_r < wr else opp_r - (wr + 1))
+            dc = 0 if wc <= opp_c <= wc + 1 else (wc - opp_c if opp_c < wc else opp_c - (wc + 1))
+            mdist = dr + dc
+
+            if critical and delta_opp >= 1:
+                priority = 1_800_000 + delta_opp * 10_000 - delta_my * 1_000 - mdist * 20 + hist_bonus
+                tactical.append((priority, wall))
+            elif delta_opp >= 1 and gain >= 1:
+                priority = 1_500_000 + gain * 10_000 + delta_opp * 100 - delta_my * 100 - mdist * 20 + hist_bonus
+                tactical.append((priority, wall))
+            elif delta_opp >= 1 and gain == 0 and allow_zero_gain:
+                priority = 1_100_000 + delta_opp * 5_000 - mdist * 20 + hist_bonus
+                tactical.append((priority, wall))
+            elif allow_setup and delta_opp == 0 and delta_my == 0:
+                touches = WALL_ON_EDGE[wall] or bool(
+                    (h_walls & WALL_TOUCH_H[wall]) | (v_walls & WALL_TOUCH_V[wall])
+                )
+                narrows = False
+                new_narrow = opp_narrow
+                if opp_narrow >= 2:
+                    new_narrow = self._race_masks(pawns[opp], goals[opp], v, h)[1]
+                    narrows = new_narrow < opp_narrow
+                if narrows or (touches and mdist <= 3) or mdist <= 2:
+                    prio = 750_000 + hist_bonus
+                    if narrows:
+                        prio += 20_000 * (opp_narrow - new_narrow)
+                        if new_narrow <= 1:
+                            prio += 15_000
+                    if touches:
+                        prio += 8_000
+                    if mdist <= 3:
+                        prio += (4 - mdist) * 2_000
+                    setup.append((prio, wall))
+
+        # Defensive / anti-trap walls when our own path is narrow and opponent has walls.
+        defensive: list[tuple[int, int]] = []
+        if self.walls_left[opp] > 0 and my_narrow <= 2 and allow_setup:
+            raw_my = self._raw_threats(pawns[side], goals[side], my_d, vmask, hmask)
+            if raw_my:
+                opp_single = self._single_blockers(pawns[opp], goals[opp], vmask, hmask)
+                threats: list[tuple[int, int]] = []
+                for d_my, tw in raw_my:
+                    if d_my < 2:
+                        break
+                    if tw in opp_single:
+                        tv, th = self._masks_after(tw)
+                        new_opp_t = dist(pawns[opp], goals[opp], tv, th)
+                        if new_opp_t is None:
+                            continue
+                        net_t = d_my - (new_opp_t - opp_d)
+                    else:
+                        net_t = d_my
+                    if net_t >= 2:
+                        threats.append((net_t, tw))
+                if threats:
+                    threats.sort(reverse=True)
+                    def_seen: set[int] = set()
+                    for net_t, tw in threats[:3]:
+                        for wall in WALL_CONFLICTS[tw]:
+                            if wall in def_seen or not self.geometry_ok(wall):
+                                continue
+                            def_seen.add(wall)
+                            v, h = self._masks_after(wall)
+                            if wall in my_blocks:
+                                new_my = dist(pawns[side], goals[side], v, h)
+                                if new_my != my_d:
+                                    continue
+                            if wall in opp_single:
+                                new_opp = dist(pawns[opp], goals[opp], v, h)
+                                if new_opp is None:
+                                    continue
+                                delta_opp = new_opp - opp_d
+                            else:
+                                delta_opp = 0
+                            prio = (
+                                1_200_000
+                                + net_t * 10_000
+                                + delta_opp * 5_000
+                                + (min(self.history[wall], 4_000) >> 4)
+                            )
+                            defensive.append((prio, wall))
+
+        if not tactical and not defensive and not setup:
             return []
-        scored.sort(reverse=True)
+        tactical.sort(reverse=True)
+        defensive.sort(reverse=True)
+        setup.sort(reverse=True)
+
         if root:
-            limit = 14
+            tac_limit, def_limit, setup_limit = 14, 3, 3
         elif critical:
-            limit = 10
+            tac_limit, def_limit, setup_limit = 10, 2, 2
         elif depth >= 8:
-            limit = 7
+            tac_limit, def_limit, setup_limit = 7, 3, 3
         elif depth >= 5:
-            limit = 5
+            tac_limit, def_limit, setup_limit = 5, 2, 2
         elif depth >= 3:
-            limit = 4
+            tac_limit, def_limit, setup_limit = 4, 2, 2
         else:
-            limit = 3
-        return scored[:limit]
+            tac_limit, def_limit, setup_limit = 3, 2, 2
+
+        combined: list[tuple[int, int]] = []
+        used: set[int] = set()
+        for bucket, lim in ((tactical, tac_limit), (defensive, def_limit), (setup, setup_limit)):
+            count = 0
+            for item in bucket:
+                w = item[1]
+                if w in used:
+                    continue
+                used.add(w)
+                combined.append(item)
+                count += 1
+                if count >= lim:
+                    break
+        combined.sort(reverse=True)
+        return combined
+
+    def _pawn_moves(self, skip_move: int = -1) -> list[int]:
+        side = self.side
+        goal = self.goals[side]
+        v, h = self.vmask, self.hmask
+        dist = self._dist
+        my_d = dist(self.pawns[side], goal, v, h)
+        scored: list[tuple[int, int]] = []
+        for dest in self._pawn_destinations():
+            if dest == skip_move:
+                continue
+            if dest // 9 == goal:
+                priority = 3_000_000
+            else:
+                d_dest = dist(dest, goal, v, h)
+                if my_d is not None and d_dest is not None and d_dest < my_d:
+                    priority = 2_000_000 + (my_d - d_dest) * 100_000 - abs((dest % 9) - 4)
+                else:
+                    priority = 1_000_000 - abs(ROW[dest] - goal) * 1_000 - abs((dest % 9) - 4)
+            priority += min(self.history[dest], 4_000) >> 4
+            scored.append((priority, dest))
+        if len(scored) > 1:
+            scored.sort(reverse=True)
+        return [move for _priority, move in scored]
 
     def generate(self, depth: int, tt_move: int) -> list[int]:
         side = self.side
         goal = self.goals[side]
-        info = self.analyze()
-        my_step = info[side][2]
+        my_step = self._path(self.pawns[side], goal)[2]
         scored: list[tuple[int, int]] = []
 
         for dest in self._pawn_destinations():
@@ -786,12 +1103,20 @@ class Engine:
         ply = self.ply if self.ply < len(self.killers) else len(self.killers) - 1
         insert_at = 1 if ordered and ordered[0] == tt_move else 0
         for killer in self.killers[ply]:
-            if killer < 0 or killer == tt_move or not self._plausible(killer):
+            if killer < 0 or killer == tt_move:
                 continue
-            if killer in ordered:
+            if killer < 81:
+                if not self._plausible(killer):
+                    continue
+                if killer in ordered:
+                    ordered.remove(killer)
+                ordered.insert(insert_at, killer)
+                insert_at += 1
+            elif killer in ordered:
+                # Only promote wall killers already in context (never inject foreign walls).
                 ordered.remove(killer)
-            ordered.insert(insert_at, killer)
-            insert_at += 1
+                ordered.insert(insert_at, killer)
+                insert_at += 1
         return ordered
 
     def _plausible(self, move: int) -> bool:
@@ -825,6 +1150,7 @@ class Engine:
             return -self.contempt if self.side == 0 else self.contempt
 
         extended = False
+        opp_d = None
         if 0 < depth < 6 and self.ext < 2 and self.walls_left[self.side] > 0:
             packed = self.distances()
             opp_d = packed[1] if self.side == 0 else packed[0]
@@ -851,13 +1177,17 @@ class Engine:
                         return tt_score
 
             if depth <= 0:
-                return self.evaluate()
+                return self.evaluate(alpha, beta)
 
             best = -INF
             best_move = -1
+            tried_tt = -1
             node_ply = self.ply
-            # Hash move first. A cutoff here skips wall generation entirely.
+            move_idx = 0
+
+            # Stage 1: Hash move first. A cutoff here skips all move generation.
             if tt_move >= 0 and self._plausible(tt_move):
+                tried_tt = tt_move
                 token = self.apply(tt_move)
                 try:
                     if token[1]:
@@ -868,18 +1198,17 @@ class Engine:
                     self.undo(token)
                 best = score
                 best_move = tt_move
+                move_idx = 1
                 if score > alpha:
                     alpha = score
                 if alpha >= beta:
                     self._push_killer(node_ply, tt_move)
                     self.history[tt_move] += depth * depth
 
+            # Stage 2: Pawn moves before BFS-heavy wall generation.
             if alpha < beta:
-                moves = self.generate(depth, tt_move)
                 first = best_move < 0
-                for move in moves:
-                    if move == best_move:
-                        continue
+                for move in self._pawn_moves(tried_tt):
                     token = self.apply(move)
                     try:
                         if token[1]:
@@ -893,35 +1222,87 @@ class Engine:
                     finally:
                         self.undo(token)
                     first = False
+                    move_idx += 1
                     if score > best:
                         best = score
                         best_move = move
                     if best > alpha:
                         alpha = best
                     if alpha >= beta:
-                        self._push_killer(node_ply, move)
                         self.history[move] += depth * depth
                         break
+
+            # Stage 3: Wall moves only if pawn moves did not cause a beta cutoff.
+            if alpha < beta and self.walls_left[self.side] > 0:
+                wall_scored = self._collect_walls(depth)
+                if wall_scored:
+                    walls = [move for _priority, move in wall_scored]
+                    kply = node_ply if node_ply < len(self.killers) else len(self.killers) - 1
+                    killers_here = self.killers[kply]
+                    insert_at = 0
+                    for killer in killers_here:
+                        if killer >= 81 and killer != tried_tt and killer in walls:
+                            walls.remove(killer)
+                            walls.insert(insert_at, killer)
+                            insert_at += 1
+                    if opp_d is None:
+                        opp = self.side ^ 1
+                        opp_d = self._dist(self.pawns[opp], self.goals[opp], self.vmask, self.hmask)
+                    lmr_ok = depth >= 3 and (opp_d is None or opp_d > 2)
+                    first = best_move < 0
+                    for move in walls:
+                        if move == tried_tt:
+                            continue
+                        is_killer = move == killers_here[0] or move == killers_here[1]
+                        token = self.apply(move)
+                        try:
+                            if first:
+                                score = -self.negamax(depth - 1, -beta, -alpha)
+                            elif lmr_ok and move_idx >= 4 and not is_killer:
+                                score = -self.negamax(depth - 2, -alpha - 1, -alpha)
+                                if score > alpha:
+                                    score = -self.negamax(depth - 1, -alpha - 1, -alpha)
+                                    if alpha < score < beta:
+                                        score = -self.negamax(depth - 1, -beta, -alpha)
+                            else:
+                                score = -self.negamax(depth - 1, -alpha - 1, -alpha)
+                                if alpha < score < beta:
+                                    score = -self.negamax(depth - 1, -beta, -alpha)
+                        finally:
+                            self.undo(token)
+                        first = False
+                        move_idx += 1
+                        if score > best:
+                            best = score
+                            best_move = move
+                        if best > alpha:
+                            alpha = best
+                        if alpha >= beta:
+                            self._push_killer(node_ply, move)
+                            self.history[move] += depth * depth
+                            break
 
             if best_move < 0:
                 return self.evaluate()
 
-            stored = best
-            if stored > MATE_BOUND:
-                stored += self.ply
-            elif stored < -MATE_BOUND:
-                stored -= self.ply
-            if best <= alpha_orig:
-                flag = UPPER
-            elif best >= beta:
-                flag = LOWER
-            else:
-                flag = EXACT
-            previous = self.tt.get(self.zhash)
-            if previous is None or depth >= previous[0]:
-                if len(self.tt) > TT_LIMIT:
-                    self._age_tt()
-                self.tt[self.zhash] = (depth, stored, flag, best_move)
+            # Do not store path-dependent repetition/contempt scores into TT.
+            if best != self.contempt and best != -self.contempt:
+                stored = best
+                if stored > MATE_BOUND:
+                    stored += self.ply
+                elif stored < -MATE_BOUND:
+                    stored -= self.ply
+                if best <= alpha_orig:
+                    flag = UPPER
+                elif best >= beta:
+                    flag = LOWER
+                else:
+                    flag = EXACT
+                previous = self.tt.get(self.zhash)
+                if previous is None or depth >= previous[0]:
+                    if len(self.tt) > TT_LIMIT:
+                        self._age_tt()
+                    self.tt[self.zhash] = (depth, stored, flag, best_move)
             return best
         finally:
             self.line.discard(zhash)
@@ -946,13 +1327,32 @@ class Engine:
             self.killers[ply][0] = move
             self.killers[ply][1] = first if first != move else second
 
-    def _root_bias(self, move: int, my_d: int) -> int:
-        """Shuffling away from the goal hands the opponent free tempo; demand a reason."""
-        if move >= 81 or my_d is None:
+    def _root_bias(self, move: int, my_d: int, opp_d: int | None = None) -> int:
+        """Discourage regressive pawn shuffles and isolated far back-rank +1 wall dumps."""
+        if move < 81:
+            if my_d is None:
+                return 0
+            after = self._dist(move, self.goals[0], self.vmask, self.hmask)
+            if after is not None and after > my_d:
+                return -REGRESS_PENALTY
             return 0
-        after = self._dist(move, self.goals[0], self.vmask, self.hmask)
-        if after is not None and after > my_d:
-            return -REGRESS_PENALTY
+        # Penalize isolated floating walls placed far from the opponent on an open board
+        # that only add +1 statically (horizon-effect back-rank wall spam).
+        if opp_d is not None and opp_d >= 4:
+            touches = WALL_ON_EDGE[move] or bool(
+                (self.h_walls & WALL_TOUCH_H[move]) | (self.v_walls & WALL_TOUCH_V[move])
+            )
+            if not touches:
+                opp_r, opp_c = divmod(self.pawns[1], 9)
+                wr, wc = WALL_POS[move]
+                dr = 0 if wr <= opp_r <= wr + 1 else (wr - opp_r if opp_r < wr else opp_r - (wr + 1))
+                dc = 0 if wc <= opp_c <= wc + 1 else (wc - opp_c if opp_c < wc else opp_c - (wc + 1))
+                mdist = dr + dc
+                if mdist >= 3:
+                    v, h = self._masks_after(move)
+                    new_opp = self._dist(self.pawns[1], self.goals[1], v, h)
+                    if new_opp is not None and new_opp - opp_d <= 1:
+                        return -min(45, 15 * (mdist - 1))
         return 0
 
     def _child_hash(self, move: int) -> int:
@@ -973,50 +1373,100 @@ class Engine:
                 return kept
         return moves
 
-    def search_root(self, depth: int):
+    def search_root(
+        self,
+        depth: int,
+        alpha: int = -INF,
+        beta: int = INF,
+        opening_variety: bool = False,
+    ):
         entry = self.tt.get(self.zhash)
         tt_move = entry[3] if entry is not None else -1
         moves = self.root_moves(depth, tt_move)
         if not moves:
             raise RuntimeError("No legal move.")
-        my_d = self.distances()[0]
+        my_d, opp_d = self.distances()
 
-        alpha = -INF
+        alpha_orig = alpha
+        narrowed = alpha_orig > -INF or beta < INF
         best_move = None
         best_score = -INF
+        move_scores: list[tuple[int, int, bool]] = []
         for index, move in enumerate(moves):
             if time.perf_counter() >= self.deadline and best_move is not None:
+                if depth >= 2 or narrowed:
+                    raise SearchTimeout
                 break
-            bias = self._root_bias(move, my_d)
-            # Search for the raw score that would beat alpha once the bias is added.
-            target = alpha - bias
+            bias = self._root_bias(move, my_d, opp_d)
+            raw_alpha = alpha - bias if -MATE_BOUND < alpha < MATE_BOUND else alpha
+            raw_beta = beta - bias if -MATE_BOUND < beta < MATE_BOUND else beta
             token = self.apply(move)
             try:
                 if token[1]:
                     score = MATE - self.ply
+                    is_exact = True
                 elif index == 0:
-                    score = -self.negamax(depth - 1, -INF, INF)
+                    score = -self.negamax(depth - 1, -raw_beta, -raw_alpha)
+                    is_exact = raw_alpha < score < raw_beta
+                elif opening_variety and -MATE_BOUND < raw_alpha < MATE_BOUND:
+                    # Keep exact scores for all moves within 15 points of best_score.
+                    band = raw_alpha - 16
+                    score = -self.negamax(depth - 1, -band - 1, -band)
+                    if score > band:
+                        score = -self.negamax(depth - 1, -raw_beta, -band)
+                        is_exact = band < score < raw_beta
+                    else:
+                        is_exact = False
                 else:
-                    score = -self.negamax(depth - 1, -target - 1, -target)
-                    if score > target:
-                        score = -self.negamax(depth - 1, -INF, -target)
+                    score = -self.negamax(depth - 1, -raw_alpha - 1, -raw_alpha)
+                    if raw_alpha < score < raw_beta:
+                        score = -self.negamax(depth - 1, -raw_beta, -raw_alpha)
+                        is_exact = raw_alpha < score < raw_beta
+                    else:
+                        is_exact = False
             except SearchTimeout:
                 self.undo(token)
-                if best_move is None:
+                if best_move is None or depth >= 2 or narrowed:
                     raise
                 break
             else:
                 self.undo(token)
             if -MATE_BOUND < score < MATE_BOUND:
                 score += bias
+            move_scores.append((move, score, is_exact))
             if best_move is None or score > best_score:
                 best_score = score
                 best_move = move
             if score > alpha:
                 alpha = score
-        return best_move, best_score
+            if alpha >= beta:
+                break
+        # Seed root TT entry so subsequent iterations and re-searches try best_move first.
+        if best_move is not None and best_score != self.contempt and best_score != -self.contempt:
+            if best_score <= alpha_orig:
+                flag = UPPER
+            elif best_score >= beta:
+                flag = LOWER
+            else:
+                flag = EXACT
+            stored = best_score
+            if stored > MATE_BOUND:
+                stored += self.ply
+            elif stored < -MATE_BOUND:
+                stored -= self.ply
+            previous = self.tt.get(self.zhash)
+            if previous is None or depth >= previous[0]:
+                if len(self.tt) > TT_LIMIT:
+                    self._age_tt()
+                self.tt[self.zhash] = (depth, stored, flag, best_move)
+        return best_move, best_score, move_scores
 
-    def choose(self, budget: float):
+    def choose(self, budget: float, opening_variety: bool = False):
+        if len(self.dcache) > 400_000:
+            self.dcache.clear()
+        if len(self.paths) > 200_000:
+            self.paths.clear()
+
         start = time.perf_counter()
         self.deadline = start + max(0.01, budget)
         self.nodes = 0
@@ -1035,6 +1485,9 @@ class Engine:
 
         best_move = None
         best_score = -INF
+        self.completed_depth = 0
+        self.completed_score = -INF
+        completed_move_scores: list[tuple[int, int, bool]] = []
         # Best move of the deepest iteration that still saw a game left to play.
         hopeful = None
         hopeful_depth = 0
@@ -1043,6 +1496,11 @@ class Engine:
         if step >= 0 and not self._is_banned(step):
             best_move = step
 
+        stable_iters = 0
+        prev_best_move = None
+        prev_best_score = None
+        loss_cap = min(budget, 0.5)
+
         for depth in range(1, 32):
             now = time.perf_counter()
             # The next iteration costs several times the last one; do not start
@@ -1050,30 +1508,96 @@ class Engine:
             if now >= self.deadline or (depth > 2 and now - start > 0.45 * budget):
                 break
             try:
-                move, score = self.search_root(depth)
+                if depth >= 3 and abs(best_score) < FORCED_RACE:
+                    lo_delta = 150
+                    hi_delta = 150
+                    lo = best_score - lo_delta
+                    hi = best_score + hi_delta
+                    while True:
+                        move, score, move_scores = self.search_root(
+                            depth, lo, hi, opening_variety=opening_variety
+                        )
+                        if score <= lo and lo > -INF:
+                            if lo_delta == 150:
+                                lo_delta = 400
+                                lo = best_score - lo_delta
+                            else:
+                                lo = -INF
+                        elif score >= hi and hi < INF:
+                            if hi_delta == 150:
+                                hi_delta = 400
+                                hi = best_score + hi_delta
+                            else:
+                                hi = INF
+                        else:
+                            break
+                else:
+                    move, score, move_scores = self.search_root(
+                        depth, -INF, INF, opening_variety=opening_variety
+                    )
             except SearchTimeout:
                 break
             if move is None:
                 break
             best_move = move
             best_score = score
+            completed_move_scores = move_scores
             self.completed_depth = depth
             self.completed_score = score
+
+            if move == prev_best_move and prev_best_score is not None and abs(score - prev_best_score) < 30:
+                stable_iters += 1
+            else:
+                stable_iters = 1
+            prev_best_move = move
+            prev_best_score = score
+
             if score > -3 * STEP:
                 hopeful = move
                 hopeful_depth = depth
             if score >= MATE - 40 or score >= FORCED_RACE:
                 break
             if score <= -(MATE - 40):
+                # Do not stop at depth 1/2 (e.g. shallow TT hit); search through at least
+                # depth 3 within loss_cap so all root moves compare distance-to-mate.
+                if depth >= 3 or (time.perf_counter() - start) >= loss_cap:
+                    break
+            if depth >= 5 and stable_iters >= 3 and (time.perf_counter() - start) > 0.35 * budget:
                 break
-        # Against perfect play every move loses. Keep the line that looked
-        # close a ply shorter, so a single slip still lets us through. A
-        # shallower or already-bleak hope is noise: keep the race as close as possible.
-        if best_score <= -FORCED_RACE:
-            if hopeful is not None and hopeful_depth >= self.completed_depth - 1:
-                best_move = hopeful
-            else:
+
+        # Forced-loss handling:
+        # When proven mate (<= -(MATE - 40)) at completed_depth >= 2, trust search's
+        # best_move (-(MATE - ply) already prefers maximum distance-to-mate).
+        # Only invoke _delaying_move() if best_move is None, proven mate had depth < 2,
+        # or static FORCED_RACE had all root moves tied at the exact same score.
+        if best_move is None:
+            best_move = self._delaying_move(None)
+        elif best_score <= -(MATE - 40):
+            if self.completed_depth < 2:
                 best_move = self._delaying_move(best_move)
+        elif best_score <= -FORCED_RACE:
+            distinct_scores = {s for _m, s, _ex in completed_move_scores}
+            if len(distinct_scores) <= 1:
+                if hopeful is not None and hopeful_depth >= self.completed_depth - 1:
+                    best_move = hopeful
+                else:
+                    best_move = self._delaying_move(best_move)
+
+        # Opening variety: pick randomly among sound near-equal top moves (within 15 pts).
+        if (
+            opening_variety
+            and completed_move_scores
+            and -FORCED_RACE < best_score < MATE - 40
+        ):
+            near_best = [
+                m for m, s, ex in completed_move_scores
+                if ex and s >= best_score - 15 and s > -FORCED_RACE
+            ]
+            if best_move not in near_best and best_move is not None:
+                near_best.append(best_move)
+            if len(near_best) > 1:
+                best_move = random.choice(near_best)
+
         if best_move is None:
             dests = self._pawn_destinations()
             free = [dest for dest in dests if not self._is_banned(dest)]
@@ -1081,7 +1605,7 @@ class Engine:
         return best_move
 
     def _delaying_move(self, fallback):
-        """Every line loses: keep the race as close as the board allows, so a slip can still be punished."""
+        """Every line loses: delay mate as long as possible without hoarding walls or oscillating."""
         best, best_key = fallback, None
         # Runs after the search, often past its deadline; wall generation checks it.
         self.deadline = max(self.deadline, time.perf_counter() + 0.05)
@@ -1094,6 +1618,7 @@ class Engine:
             try:
                 if token[1]:
                     return move
+                child_hash = self.zhash
                 r0, r1 = self.races()
             finally:
                 self.undo(token)
@@ -1101,7 +1626,18 @@ class Engine:
             if mine is None or theirs is None:
                 continue
             walls = self.walls_left[0] - (move >= 81)
-            key = ((theirs - mine) * STEP + WALL_VALUE[walls], move < 81)
+            repeats = self.played.get(child_hash, 0)
+            # Penalize repeats heavily; prioritize delaying opponent (extra urgency when
+            # theirs <= 4); tie-break by advancing our pawn and tiny credit for walls.
+            score = (
+                -repeats * 50_000
+                + (theirs - mine) * STEP
+                + min(theirs, 5) * 200
+                - (5_000 if theirs <= 1 else 0)
+                - mine * 20
+                + walls * 10
+            )
+            key = (score, theirs, -mine, move < 81)
             if best_key is None or key > best_key:
                 best, best_key = move, key
         return best
@@ -1144,11 +1680,10 @@ class MyPlayer(PlayerQuoridor):
 
     def __init__(self, piece_type: str, goal_row: int = 0, name: str = "bob", *args, **kwargs) -> None:
         super().__init__(piece_type, goal_row, name, *args, **kwargs)
-        self._cache: dict = {}
         self._paths: dict = {}
         self._tt: dict = {}
         self._history = [0] * 264
-        self._engine = Engine(self._cache, self._paths, self._tt, self._history)
+        self._engine = Engine(self._paths, self._tt, self._history)
         self.last_depth = 0
         self.last_score = 0
         self.last_nodes = 0
@@ -1157,6 +1692,8 @@ class MyPlayer(PlayerQuoridor):
         # walls: the hash holds the walls, so old entries simply never match.
         self._visits: dict[int, int] = {}
         self._last_step = -1
+        self._last_contempt: int | None = None
+        self._last_banned: frozenset[int] = frozenset()
         self._clock_total = 15 * 60.0
         # The harness only tells us our own clock. Theirs is the wall time
         # between our replies, transport included.
@@ -1168,7 +1705,7 @@ class MyPlayer(PlayerQuoridor):
     def compute_action(self, current_state: GameStateQuoridor, remaining_time: float = 15 * 60, **kwargs) -> Action:
         started = time.perf_counter()
         step = current_state.get_step()
-        if step < self._last_step or self._last_step < 0:
+        if step <= self._last_step or self._last_step < 0:
             self._new_game(remaining_time)
         elif self._returned_at is not None:
             self._opp_used += started - self._returned_at
@@ -1186,19 +1723,28 @@ class MyPlayer(PlayerQuoridor):
         else:
             engine.banned = set()
 
+        banned_key = frozenset(engine.banned)
+        if self._last_contempt is not None and (
+            engine.contempt != self._last_contempt or banned_key != self._last_banned
+        ):
+            self._tt.clear()
+        self._last_contempt = engine.contempt
+        self._last_banned = banned_key
+
         info = engine.analyze()
         my_d = info[0][0] or 8
         opp_d = info[1][0] or 8
         my_walls, opp_walls = engine.walls_left
         opening = not current_state.rep.walls and min(my_d, opp_d) >= 5
+        opening_variety = step <= 6 and len(current_state.rep.walls) == 0 and visits == 1
         contact = engine._pawns_facing()
         budget = self._budget(remaining_time, my_d, opp_d, my_walls, opp_walls, opening, step, contact)
         if visits >= 2:
-            # Searched before, and the table still holds it.
+            # Searched before; cap repeat think time.
             budget = min(budget, REPEAT_BUDGET)
 
         try:
-            move = engine.choose(budget)
+            move = engine.choose(budget, opening_variety=opening_variety)
             child = engine._child_hash(move)
             self._visits[child] = self._visits.get(child, 0) + 1
             action = engine.to_action(move)
@@ -1221,6 +1767,13 @@ class MyPlayer(PlayerQuoridor):
 
     def _new_game(self, remaining: float) -> None:
         self._visits.clear()
+        self._tt.clear()
+        self._paths.clear()
+        self._engine.dcache.clear()
+        self._history = [0] * 264
+        self._engine.history = self._history
+        self._last_contempt = None
+        self._last_banned = frozenset()
         self._clock_total = max(remaining, 1.0)
         self._returned_at = None
         self._opp_used = 0.0
