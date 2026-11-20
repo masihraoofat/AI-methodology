@@ -883,9 +883,11 @@ class Engine:
         opp_d, opp_narrow, _opp_step, blockers = self._path(pawns[opp], goals[opp])
         if my_d is None or opp_d is None or not blockers:
             return []
-        # Ahead, and they have nothing left to drop in front of us: run.
+        # Ahead, they have no walls left, and pawns cannot meet: just run.
         if self.walls_left[opp] == 0 and opp_d >= my_d:
-            return []
+            d0, d1 = (my_d, opp_d) if side == 0 else (opp_d, my_d)
+            if not self._pawns_interact(d0, d1):
+                return []
 
         root = self.ply == 0
         critical = opp_d <= 2
@@ -1738,7 +1740,11 @@ class MyPlayer(PlayerQuoridor):
         opening = not current_state.rep.walls and min(my_d, opp_d) >= 5
         opening_variety = step <= 6 and len(current_state.rep.walls) == 0 and visits == 1
         contact = engine._pawns_facing()
-        budget = self._budget(remaining_time, my_d, opp_d, my_walls, opp_walls, opening, step, contact)
+        pawns_interact = engine._pawns_interact(my_d, opp_d)
+        budget = self._budget(
+            remaining_time, my_d, opp_d, my_walls, opp_walls,
+            opening, step, contact, pawns_interact,
+        )
         if visits >= 2:
             # Searched before; cap repeat think time.
             budget = min(budget, REPEAT_BUDGET)
@@ -1826,14 +1832,15 @@ class MyPlayer(PlayerQuoridor):
             self._log_path = None
 
     def _budget(self, remaining: float, my_d: int, opp_d: int, my_walls: int, opp_walls: int,
-                opening: bool = False, step: int = 0, contact: bool = False) -> float:
+                opening: bool = False, step: int = 0, contact: bool = False,
+                pawns_interact: bool = False) -> float:
         if remaining <= 0:
             return 0.02
         # Pawn-only tree. A second is enough to see a jump, then the search stops.
         if my_walls + opp_walls == 0:
             return min(1.0, max(0.02, remaining * 0.02))
-        # They cannot wall, we still hold some, and the static race is not behind.
-        if opp_walls == 0 and my_d <= opp_d:
+        # They cannot wall, we still hold some, and the static race is safely won.
+        if opp_walls == 0 and my_d <= opp_d and not pawns_interact:
             return min(0.3, max(0.02, remaining * 0.005))
 
         # Our own moves still to come: the walk plus the walls likely to be traded.
