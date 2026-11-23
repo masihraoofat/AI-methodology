@@ -43,11 +43,11 @@ STEP = 120
 TEMPO = STEP // 2
 
 # ---- Wall pricing -------------------------------------------------------
-# Worth of the walls still in hand, indexed by count. Every wall is priced
-# above a single pawn step (120) so early walls are not dumped lightly, while
-# late walls stay below 2.1x a step to avoid hoarding in losing endgames.
-# Marginals, tenth wall to first: 135 145 155 165 175 185 200 215 230 245.
-WALL_VALUE = (0, 245, 475, 690, 890, 1075, 1250, 1415, 1570, 1715, 1850)
+# Worth of the walls still in hand, indexed by count. Early walls are priced
+# well above a single pawn step (120) so they are not dumped lightly in the
+# opening, while late walls stay near 2x a step to avoid endgame hoarding.
+# Marginals, tenth wall to first: 165 170 175 180 185 195 205 215 230 245.
+WALL_VALUE = (0, 245, 475, 690, 895, 1090, 1275, 1455, 1630, 1800, 1965)
 # A root pawn move that lengthens our own path must beat the others by this much.
 REGRESS_PENALTY = 45
 
@@ -67,17 +67,18 @@ CONTEMPT = 80
 CONTEMPT_BEHIND_CLOCK = 3 * STEP
 CONTEMPT_PER_VISIT = STEP
 CONTEMPT_CAP = 20_000
-LOOP_BAN_VISITS = 4
-REPEAT_BUDGET = 0.2
+LOOP_BAN_VISITS = 3
+REPEAT_BUDGET = 1.2
 
 # ---- Time ---------------------------------------------------------------
-TIME_PLAN_SHARE = 0.40
+TIME_PLAN_SHARE = 0.52
 TIME_PLAN_PLY = 40
-CAP_SHARP = 28 / 900
-CAP_SHARP_FEW_WALLS = 18 / 900
-CAP_ORDINARY = 14 / 900
-CAP_OPENING = 6 / 900
-CAP_OVER_PLAN = 10 / 900
+CAP_SHARP = 38 / 900
+CAP_SHARP_FEW_WALLS = 34 / 900
+CAP_SHARP_NO_WALLS = 22 / 900
+CAP_ORDINARY = 20 / 900
+CAP_OPENING = 8 / 900
+CAP_OVER_PLAN = 16 / 900
 CONTACT_RESERVE = 140 / 900
 
 TT_LIMIT = 1_200_000
@@ -90,6 +91,7 @@ MOVE_LOG = os.environ.get("QUORIDOR_MOVE_LOG", "0") == "1"
 FULL_V = (1 << 72) - 1
 FULL_H = sum(1 << (r * 9 + c) for r in range(9) for c in range(8))
 WALL_GRID = FULL_H & FULL_V
+H_ROW_MASK = tuple(0xFF << (r * 9) for r in range(8))
 GOAL_MASK = tuple(sum(1 << (r * 9 + c) for c in range(9)) for r in range(9))
 ROW = tuple(i // 9 for i in range(81))
 COL = tuple(i % 9 for i in range(81))
@@ -247,6 +249,18 @@ def _wall_worth(walls: int, enemy_d: int) -> int:
         usable = WALL_VALUE[2]
         return usable + ((WALL_VALUE[walls] - usable) >> 2)
     return WALL_VALUE[walls]
+
+
+def _wall_deficit_penalty(my_w: int, opp_w: int, my_d: int, opp_d: int) -> int:
+    """Non-linear penalty for running low/out of walls while opponent can still build cages."""
+    if opp_w <= my_w or my_d < 3 or opp_d < 3:
+        return 0
+    deficit = opp_w - my_w
+    if my_w == 0:
+        return 65 * min(deficit, 4)
+    if my_w == 1 and deficit >= 2:
+        return 30 * min(deficit - 1, 3)
+    return 0
 
 
 class SearchTimeout(Exception):
@@ -942,8 +956,57 @@ class Engine:
             + TEMPO
             + _wall_worth(my_left, opp_d)
             - _wall_worth(opp_left, my_d)
+            - _wall_deficit_penalty(my_left, opp_left, my_d, opp_d)
+            + _wall_deficit_penalty(opp_left, my_left, opp_d, my_d)
             + (CENTER_DIST[opp_p] - CENTER_DIST[my_p]) * 4
         )
+
+        # Symmetric corridor-width terms: penalize self-choking and reward keeping
+        # multiple escape corridors open while the opponent still holds walls.
+        if opp_left > 0:
+            if my_narrow == 1:
+                score -= 28
+            elif my_narrow >= 3:
+                score += 14
+            if my_d >= 3:
+                my_gw = _popcount(self.h_grid & (H_ROW_MASK[0] if self.goals[side] == 0 else H_ROW_MASK[7]))
+                if my_gw:
+                    score -= 10 * my_gw + (12 if my_gw >= 2 else 0)
+        if my_left > 0:
+            if opp_narrow == 1:
+                score += 28
+            elif opp_narrow >= 3:
+                score -= 14
+            if opp_d >= 3:
+                opp_gw = _popcount(self.h_grid & (H_ROW_MASK[0] if self.goals[opp] == 0 else H_ROW_MASK[7]))
+                if opp_gw:
+                    score += 10 * opp_gw + (12 if opp_gw >= 2 else 0)
+
+        # Symmetric dead-end cul-de-sac penalty (1 open orthogonal exit when not 1 step from goal).
+        vmask = self.vmask
+        hmask = self.hmask
+        if my_d > 1:
+            my_exits = (
+                ((vmask >> (my_p - 9)) & 1 if my_p >= 9 else 0)
+                + ((vmask >> my_p) & 1)
+                + ((hmask >> (my_p - 1)) & 1 if my_p > 0 else 0)
+                + ((hmask >> my_p) & 1)
+            )
+            if my_exits <= 1:
+                score -= 135
+            elif my_exits == 2 and opp_left > 0:
+                score -= 16
+        if opp_d > 1:
+            opp_exits = (
+                ((vmask >> (opp_p - 9)) & 1 if opp_p >= 9 else 0)
+                + ((vmask >> opp_p) & 1)
+                + ((hmask >> (opp_p - 1)) & 1 if opp_p > 0 else 0)
+                + ((hmask >> opp_p) & 1)
+            )
+            if opp_exits <= 1:
+                score += 135
+            elif opp_exits == 2 and my_left > 0:
+                score += 16
 
         # Exact pawn-interaction physics when orthogonally adjacent with an open edge:
         # unified bonus for forward jumps (+60) and penalty for dead-end body-blocks (-55/-110).
@@ -1036,8 +1099,12 @@ class Engine:
         opp_v_all = opp_dag[4] & ~forbid_v
         opp_h_cut = opp_dag[5] & ~forbid_h
         opp_v_cut = opp_dag[6] & ~forbid_v
+        my_h_all = my_dag[3]
+        my_v_all = my_dag[4]
         my_h_cut = my_dag[5]
         my_v_cut = my_dag[6]
+        my_goal = goals[side]
+        opp_has_walls = self.walls_left[opp] > 0
 
         root = self.ply == 0
         critical = opp_d <= 2
@@ -1058,9 +1125,9 @@ class Engine:
         has_pos_gain = False
 
         # 1) Walls that cut ALL current shortest paths of opponent (only ~2..6 walls!).
-        for cut_bits, to_move, my_cut_mask in (
-            (opp_h_cut, ANCHOR_TO_H, my_h_cut),
-            (opp_v_cut, ANCHOR_TO_V, my_v_cut),
+        for cut_bits, to_move, my_cut_mask, my_all_mask in (
+            (opp_h_cut, ANCHOR_TO_H, my_h_cut, my_h_all),
+            (opp_v_cut, ANCHOR_TO_V, my_v_cut, my_v_all),
         ):
             bits = cut_bits
             while bits:
@@ -1089,9 +1156,31 @@ class Engine:
                 dr = 0 if wr <= opp_r <= wr + 1 else (wr - opp_r if opp_r < wr else opp_r - (wr + 1))
                 dc = 0 if wc <= opp_c <= wc + 1 else (wc - opp_c if opp_c < wc else opp_c - (wc + 1))
                 mdist = dr + dc
-                touches = W_ON_EDGE[wall] or bool(
-                    (h_grid & W_TOUCH_HG[wall]) | (v_grid & W_TOUCH_VG[wall])
+                collinear_h = wall < V_BASE and bool(h_grid & W_TOUCH_HG[wall])
+                touches_non_chain = W_ON_EDGE[wall] or bool(
+                    (v_grid & W_TOUCH_VG[wall])
+                    if wall < V_BASE
+                    else ((h_grid & W_TOUCH_HG[wall]) | (v_grid & W_TOUCH_VG[wall]))
                 )
+                touches = touches_non_chain or collinear_h
+
+                # Penalize horizontal walls near our own goal row and collinear H-wall chains
+                # that create edge-file highways (unless defending an immediate opp_d <= 2 threat).
+                own_goal_pen = 0
+                chain_pen = 0
+                if wall < V_BASE and not critical:
+                    own_goal_dist = wr if my_goal == 0 else (7 - wr)
+                    if own_goal_dist <= 2 and opp_d >= 4:
+                        own_goal_pen = 45_000 * (3 - own_goal_dist)
+                    if collinear_h:
+                        same_row_h = _popcount(h_grid & H_ROW_MASK[wr])
+                        chain_pen = 45_000 if same_row_h >= 2 else 22_000
+                self_trim_pen = (
+                    (24_000 if my_narrow <= 2 else 10_000)
+                    if (opp_has_walls and delta_my == 0 and (my_all_mask & lsb) and not critical)
+                    else 0
+                )
+                struct_pen = (own_goal_pen + chain_pen + self_trim_pen) if gain <= 2 else (own_goal_pen >> 2)
 
                 if delta_opp <= 2 and mdist <= 3:
                     synergy_seeds.append((-mdist * 10 + delta_opp * 5, wall, delta_opp, gain))
@@ -1104,7 +1193,7 @@ class Engine:
                     # Demote isolated far-away +1 horizon walls so close/connected walls
                     # are never pushed out of tac_limit by floating goal-row blockers.
                     if gain == 1 and delta_opp == 1 and not touches and mdist >= 3 and opp_d >= 4:
-                        prio = 1_150_000 - mdist * 4_000 + hist_bonus
+                        prio = 1_150_000 - mdist * 4_000 + hist_bonus - struct_pen
                     else:
                         has_pos_gain = True
                         prio = (
@@ -1112,9 +1201,10 @@ class Engine:
                             + gain * 12_000
                             + delta_opp * 500
                             - delta_my * 200
-                            + (3_500 if touches else 0)
+                            + (3_500 if touches_non_chain else 0)
                             - mdist * 1_500
                             + hist_bonus
+                            - struct_pen
                         )
                     tactical.append((prio, wall))
                 elif delta_opp >= 1 and gain == 0 and allow_zero_gain:
@@ -1125,21 +1215,29 @@ class Engine:
                         1_120_000
                         + close_seal
                         + delta_opp * 6_000
-                        + (3_000 if touches else 0)
+                        + (3_000 if touches_non_chain else 0)
                         - mdist * 1_500
                         + hist_bonus
+                        - struct_pen
                     )
                     tactical.append((prio, wall))
-                elif allow_off_setup and delta_opp == 0 and delta_my == 0:
+                elif allow_off_setup and delta_opp == 0 and delta_my == 0 and own_goal_pen == 0:
                     if touches or mdist <= 2:
-                        prio = 750_000 + hist_bonus + (8_000 if touches else 0) + max(0, 4 - mdist) * 2_000
+                        prio = (
+                            750_000
+                            + hist_bonus
+                            + (8_000 if touches_non_chain else 0)
+                            + max(0, 4 - mdist) * 2_000
+                            - chain_pen
+                            - self_trim_pen
+                        )
                         setup.append((prio, wall))
 
         # 2) Non-cutting DAG walls: guaranteed delta_opp == 0 in O(1) without BFS!
         if allow_off_setup:
-            for noncut_bits, to_move, my_cut_mask in (
-                (opp_h_all & ~opp_h_cut, ANCHOR_TO_H, my_h_cut),
-                (opp_v_all & ~opp_v_cut, ANCHOR_TO_V, my_v_cut),
+            for noncut_bits, to_move, my_cut_mask, my_all_mask in (
+                (opp_h_all & ~opp_h_cut, ANCHOR_TO_H, my_h_cut, my_h_all),
+                (opp_v_all & ~opp_v_cut, ANCHOR_TO_V, my_v_cut, my_v_all),
             ):
                 bits = noncut_bits
                 while bits:
@@ -1147,12 +1245,20 @@ class Engine:
                     bits ^= lsb
                     wall = to_move[lsb.bit_length() - 1]
                     wr, wc = W_ROW[wall], W_COL[wall]
+                    if wall < V_BASE and opp_d >= 4:
+                        own_goal_dist = wr if my_goal == 0 else (7 - wr)
+                        if own_goal_dist <= 2:
+                            continue
                     dr = 0 if wr <= opp_r <= wr + 1 else (wr - opp_r if opp_r < wr else opp_r - (wr + 1))
                     dc = 0 if wc <= opp_c <= wc + 1 else (wc - opp_c if opp_c < wc else opp_c - (wc + 1))
                     mdist = dr + dc
-                    touches = W_ON_EDGE[wall] or bool(
-                        (h_grid & W_TOUCH_HG[wall]) | (v_grid & W_TOUCH_VG[wall])
+                    collinear_h = wall < V_BASE and bool(h_grid & W_TOUCH_HG[wall])
+                    touches_non_chain = W_ON_EDGE[wall] or bool(
+                        (v_grid & W_TOUCH_VG[wall])
+                        if wall < V_BASE
+                        else ((h_grid & W_TOUCH_HG[wall]) | (v_grid & W_TOUCH_VG[wall]))
                     )
+                    touches = touches_non_chain or collinear_h
                     if mdist > 3 and not (touches and opp_narrow <= 3):
                         continue
                     # Skip if it hurts or disconnects our own path.
@@ -1186,8 +1292,13 @@ class Engine:
                             prio += 20_000 * (opp_narrow - new_narrow)
                             if new_narrow <= 1:
                                 prio += 15_000
-                        if touches:
+                        if touches_non_chain:
                             prio += 8_000
+                        if collinear_h:
+                            same_row_h = _popcount(h_grid & H_ROW_MASK[wr])
+                            prio -= 45_000 if same_row_h >= 2 else 22_000
+                        if opp_has_walls and (my_all_mask & lsb):
+                            prio -= 24_000 if my_narrow <= 2 else 10_000
                         if mdist <= 3:
                             prio += (4 - mdist) * 2_000
                         setup.append((prio, wall))
@@ -1651,7 +1762,7 @@ class Engine:
                     if token[1]:
                         score = MATE - self.ply
                     else:
-                        if self.zhash in self.line:
+                        if self.zhash in self.line or self.zhash in self.played:
                             had_line_rep = True
                         score = -self.negamax(depth - 1, -beta, -alpha, tt_move)
                 finally:
@@ -1692,7 +1803,7 @@ class Engine:
                         if token[1]:
                             score = MATE - self.ply
                         else:
-                            if self.zhash in self.line:
+                            if self.zhash in self.line or self.zhash in self.played:
                                 had_line_rep = True
                             if first:
                                 score = -self.negamax(depth - 1, -beta, -alpha, move)
@@ -1721,7 +1832,7 @@ class Engine:
                             if token[1]:
                                 score = MATE - self.ply
                             else:
-                                if self.zhash in self.line:
+                                if self.zhash in self.line or self.zhash in self.played:
                                     had_line_rep = True
                                 if first:
                                     score = -self.negamax(depth - 1, -beta, -alpha, move)
@@ -1777,7 +1888,7 @@ class Engine:
                         unreduced_wall = (wall_idx == 0 and has_pos_gain) or move == killers_here[0]
                         token = self.apply(move)
                         try:
-                            if self.zhash in self.line:
+                            if self.zhash in self.line or self.zhash in self.played:
                                 had_line_rep = True
                             if first:
                                 score = -self.negamax(depth - 1, -beta, -alpha, move)
@@ -1868,7 +1979,7 @@ class Engine:
         tt.clear()
 
     def _root_bias(self, move: int, my_d: int | None, opp_d: int | None = None) -> int:
-        """Discourage regressive pawn shuffles and isolated far back-rank +1 wall dumps."""
+        """Discourage regressive pawn shuffles, own-goal wall blockades, and far +1 dumps."""
         if move < 81:
             if my_d is None:
                 return 0
@@ -1876,13 +1987,21 @@ class Engine:
             if after is not None and after > my_d:
                 return -REGRESS_PENALTY
             return 0
+        bias = 0
         if opp_d is not None and opp_d >= 4:
+            wr, wc = W_ROW[move], W_COL[move]
+            if move < V_BASE:
+                my_goal = self.goals[0]
+                own_goal_dist = wr if my_goal == 0 else (7 - wr)
+                if own_goal_dist <= 2:
+                    bias -= 45 - own_goal_dist * 10
+                if (self.h_grid & W_TOUCH_HG[move]) and _popcount(self.h_grid & H_ROW_MASK[wr]) >= 2:
+                    bias -= 25
             touches = W_ON_EDGE[move] or bool(
                 (self.h_grid & W_TOUCH_HG[move]) | (self.v_grid & W_TOUCH_VG[move])
             )
             if not touches:
                 opp_r, opp_c = ROW[self.pawns[1]], COL[self.pawns[1]]
-                wr, wc = W_ROW[move], W_COL[move]
                 dr = 0 if wr <= opp_r <= wr + 1 else (wr - opp_r if opp_r < wr else opp_r - (wr + 1))
                 dc = 0 if wc <= opp_c <= wc + 1 else (wc - opp_c if opp_c < wc else opp_c - (wc + 1))
                 mdist = dr + dc
@@ -1895,8 +2014,8 @@ class Engine:
                         self.wkey | W_WKEY[move],
                     )
                     if new_opp is not None and new_opp - opp_d <= 1:
-                        return -min(45, 15 * (mdist - 1))
-        return 0
+                        bias -= min(45, 15 * (mdist - 1))
+        return bias
 
     def _child_hash(self, move: int) -> int:
         token = self.apply(move)
@@ -2025,7 +2144,13 @@ class Engine:
                 self.tt[self.zhash] = (depth, stored, flag, store_move)
         return best_move, best_score, move_scores
 
-    def choose(self, soft_budget: float, hard_budget: float | None = None, opening_variety: bool = False):
+    def choose(
+        self,
+        soft_budget: float,
+        hard_budget: float | None = None,
+        opening_variety: bool = False,
+        allow_early_stop: bool = True,
+    ):
         if len(self.rcache) > DIST_CACHE_LIMIT // 2:
             self.rcache.clear()
         if len(self.dag_cache) > DAG_CACHE_LIMIT // 2:
@@ -2080,7 +2205,7 @@ class Engine:
                     prev_best_move is not None
                     and (best_move != prev_best_move or (prev_best_score is not None and abs(best_score - prev_best_score) >= 45))
                 )
-                stop_share = 0.85 if unstable else 0.58
+                stop_share = 0.92 if unstable else 0.78
                 if elapsed > stop_share * soft_budget:
                     break
 
@@ -2142,7 +2267,7 @@ class Engine:
             if score <= -(MATE - 40):
                 if depth >= 3 or (time.perf_counter() - start) >= loss_cap:
                     break
-            if depth >= 8 and stable_iters >= 4 and (time.perf_counter() - start) > 0.55 * soft_budget:
+            if allow_early_stop and depth >= 8 and stable_iters >= 4 and (time.perf_counter() - start) > 0.68 * soft_budget:
                 break
 
         if best_move is None:
@@ -2314,8 +2439,14 @@ class MyPlayer(PlayerQuoridor):
             soft_budget = min(soft_budget, REPEAT_BUDGET)
             hard_budget = min(hard_budget, REPEAT_BUDGET)
 
+        allow_early_stop = remaining_time <= self._clock_total / 3.0
         try:
-            move = engine.choose(soft_budget, hard_budget, opening_variety=opening_variety)
+            move = engine.choose(
+                soft_budget,
+                hard_budget,
+                opening_variety=opening_variety,
+                allow_early_stop=allow_early_stop,
+            )
             child = engine._child_hash(move)
             self._visits[child] = self._visits.get(child, 0) + 1
             action = engine.to_action(move)
@@ -2425,7 +2556,14 @@ class MyPlayer(PlayerQuoridor):
 
         total = self._clock_total
         if sharp:
-            cap = total * (CAP_SHARP if my_walls >= 4 else CAP_SHARP_FEW_WALLS)
+            if my_walls >= 4:
+                cap = total * CAP_SHARP
+            elif my_walls >= 1 and opp_walls >= my_walls:
+                cap = total * CAP_SHARP_FEW_WALLS
+            elif my_walls >= 1:
+                cap = total * (28 / 900)
+            else:
+                cap = total * CAP_SHARP_NO_WALLS
         else:
             cap = total * CAP_ORDINARY
         if opening:
